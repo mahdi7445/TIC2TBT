@@ -30,7 +30,7 @@ jobs:
       - name: Checkout private data repo
         uses: actions/checkout@v4
         with:
-          repository: YOUR_GITHUB_USERNAME/TIC2TOOBIT-data
+          repository: mahdi7445/TIC2TBT-data
           token: ${{ secrets.DATA_REPO_PAT }}
           ref: main
           fetch-depth: 0
