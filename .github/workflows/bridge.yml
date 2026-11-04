@@ -1,0 +1,175 @@
+name: Telegram GitHub Relay
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+# Same keep-alive design as the TICB bot (subscription_bot.yml), so the relay runs 24/7 without a gap:
+#
+#  1. The VERY FIRST step queues the next run (self-chain) — before checkout / pip / anything that can fail.
+#     Previously the successor was only queued from inside bridge.py, i.e. AFTER the checkout of the private data
+#     repo (PAT) and `pip install`; any hiccup there ended the chain and only GitHub's unreliable cron was left.
+#  2. One run lasts ~5h20m (long-polling, like TICB) instead of 275 s, so the start-up gap between runs
+#     (queue + checkout + pip, ~20–40 s) happens once per 5h20m instead of every 5 minutes.
+#  3. The workflow is re-enabled on every run: GitHub switches scheduled workflows of a PUBLIC repo off after
+#     60 days without repository activity — and this code repo has none (all data lives in the private data repo).
+#  4. bridge.py itself re-checks every few minutes that a successor is waiting, and ends a frozen run cleanly.
+#  5. The cron is only a backup (every 15 min): concurrency keeps at most ONE run waiting, so it can never pile up.
+#
+# ⚠ Needs a PUBLIC repo (Actions minutes are free and unlimited there). On a private repo this would use the monthly
+# free minutes within a day.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"      # backup only — the self-chain below is the real keep-alive
+  workflow_dispatch:
+    inputs:
+      quick_test_seconds:
+        description: "Quick test: run only this many seconds (empty = full ~5h20m run)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read      # this PUBLIC repo now holds code only
+  actions: write      # lets the relay queue its own next run / re-enable itself
+
+concurrency:
+  group: telegram-github-relay
+  cancel-in-progress: false     # a newly queued run waits for the current one; never two relays at once
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340        # a bit more than the 5h20m loop, leaves time for the final push
+
+    steps:
+      # 0) FIRST, unconditional: make sure the workflow is enabled and the successor run is queued.
+      #    -R is required because no repository is checked out yet. One failure here must not stop the real work
+      #    (continue-on-error); bridge.py then queues the successor itself (BRIDGE_SUCCESSOR_QUEUED stays empty).
+      - name: Keep-alive — enable workflow and queue the next run
+        id: chain
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow enable "bridge.yml" -R "${{ github.repository }}" || echo "::notice::workflow was already enabled"
+          for i in 1 2 3 4; do
+            if gh workflow run "bridge.yml" --ref "${{ github.ref_name }}" -R "${{ github.repository }}"; then
+              echo "queued=1" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::warning::queueing the next run failed (attempt $i/4)"
+            sleep $((i * 3))
+          done
+          echo "::warning::Self-chain could not queue the next run — bridge.py will retry, the cron is the backup."
+
+      # 1) the relay CODE comes from this public repo (one retry if GitHub hiccups)
+      - name: Checkout relay code (public repo)
+        id: code1
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          path: code
+          fetch-depth: 1
+      - name: Checkout relay code (retry)
+        if: steps.code1.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          path: code
+          fetch-depth: 1
+
+      # 2) all DATA (signals / outbox / commands / control / heartbeat / bridge state) lives in a PRIVATE repo.
+      #    DATA_REPO_PAT = fine-grained token limited to that one repo, Contents: Read and write.
+      #    fetch-depth: 1 — the data repo gets thousands of tiny commits a day (heartbeat, outbox…); cloning its whole
+      #    history made every start slower and slower. Up to 3 attempts so one network error does not cost a cycle.
+      - name: Checkout private data repo
+        id: data1
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: mahdi7445/TIC2TBT-data
+          token: ${{ secrets.DATA_REPO_PAT }}
+          ref: main
+          fetch-depth: 1
+          path: data
+      - name: Checkout private data repo (retry 2)
+        id: data2
+        if: steps.data1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: mahdi7445/TIC2TBT-data
+          token: ${{ secrets.DATA_REPO_PAT }}
+          ref: main
+          fetch-depth: 1
+          path: data
+      - name: Checkout private data repo (retry 3)
+        if: steps.data1.outcome == 'failure' && steps.data2.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          repository: mahdi7445/TIC2TBT-data
+          token: ${{ secrets.DATA_REPO_PAT }}
+          ref: main
+          fetch-depth: 1
+          path: data
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install bridge dependency
+        run: |
+          python -m pip install --upgrade pip || true
+          for i in 1 2 3; do
+            python -m pip install --retries 5 --timeout 30 -r code/telegram-github-bridge/requirements.txt && exit 0
+            echo "::warning::pip install failed (attempt $i/3)"; sleep $((i * 4))
+          done
+          exit 1
+
+      - name: Run Telegram GitHub relay (continuous loop)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+          # Same key as USER_VAULT_MASTER_KEY in the Windows .env: encrypts a subscriber's
+          # API key/secret BEFORE it is written to the data repo. Without it the
+          # bridge refuses /connect entirely (never falls back to plaintext).
+          USER_VAULT_MASTER_KEY: ${{ secrets.USER_VAULT_MASTER_KEY }}
+          # TICB link: t.me links a subscriber button may carry (renew in the TICB bot / open the other executor bot)
+          TICB_BOT_USERNAME: ${{ secrets.TICB_BOT_USERNAME }}
+          OTHER_EXECUTOR_BOT_USERNAME: ${{ secrets.OTHER_EXECUTOR_BOT_USERNAME || 'TIC2TICbot' }}
+          # ~5h20m, like TICB's loop; quick_test_seconds lets you test a short run from the Actions tab.
+          BRIDGE_RUNTIME_SECONDS: ${{ github.event.inputs.quick_test_seconds || '19200' }}
+          TELEGRAM_LONG_POLL_SECONDS: "1"
+          MAX_RELAY_LINES: "5000"
+          PUSH_MIN_INTERVAL_SECONDS: "0.5"
+          PULL_MIN_INTERVAL_SECONDS: "1.5"
+          # Used by bridge.py to keep a successor queued and to re-queue if the first step could not.
+          GH_DISPATCH_TOKEN: ${{ github.token }}
+          BRIDGE_WORKFLOW_FILE: "bridge.yml"
+          BRIDGE_SUCCESSOR_QUEUED: ${{ steps.chain.outputs.queued }}
+        working-directory: data
+        run: |
+          python ../code/telegram-github-bridge/bridge.py
+
+      # Safety net: anything committed locally but not yet pushed (e.g. the run was cut at the very end) is pushed now.
+      - name: Final push (safety net)
+        if: always()
+        working-directory: data
+        run: |
+          [ -d .git ] || exit 0
+          git config user.name "telegram-github-bridge"
+          git config user.email "actions@users.noreply.github.com"
+          for i in 1 2 3 4 5; do
+            if [ "$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)" = "0" ]; then echo "nothing to push"; exit 0; fi
+            git push origin HEAD:main && exit 0
+            git fetch origin main || true
+            git rebase -X theirs origin/main || git rebase --abort || true
+            sleep $i
+          done
+          exit 0
+
+      # If something failed before the relay even started (token expired, GitHub outage…), the next run is already
+      # queued and would start at once and fail the same way, in a tight loop. A short pause keeps that calm.
+      - name: Cool-down after a failure
+        if: failure()
+        run: sleep 90
